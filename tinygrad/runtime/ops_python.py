@@ -100,17 +100,16 @@ class PythonProgram(Program['PythonDevice']):
                 if u.arg[0] == 'g': values[u] = [idxs[2-int(u.arg[-1])]] * warp_size
                 elif u.arg[0] == 'l': values[u] = [x[2-int(u.arg[-1])] for x in warp]
             case Ops.INDEX | Ops.SHRINK:
-                ret: list = []
+                values[u] = []
                 if u.src[0].addrspace is AddrSpace.ALU:
-                    ret = [src_values[0][i][t] for t,i in enumerate(src_values[1])]
+                    values[u] = [src_values[0][i][t] for t,i in enumerate(src_values[1])]
                 elif is_image_shape(u.src[0]._shape):
                     for m,oy,ox in zip(*src_values):
-                        if ox < 0 or ox >= u.src[0]._shape[1] or oy < 0 or oy >= u.src[0]._shape[0]: ret.append((m, None))
-                        else: ret.append((m, ox*4 + oy*u.src[0]._shape[1]*4))
+                        if ox < 0 or ox >= u.src[0]._shape[1] or oy < 0 or oy >= u.src[0]._shape[0]: values[u].append((m, None))
+                        else: values[u].append((m, ox*4 + oy*u.src[0]._shape[1]*4))
                 else:
                     scale = u.src[0].dtype.itemsize // u.src[0].src[0].dtype.itemsize if u.src[0].op is Ops.BITCAST else 1
-                    for m,o in zip(src_values[0], src_values[1]): ret.append((m[0], m[1]+o*scale) if isinstance(m, tuple) else (m, o*scale))
-                values[u] = ret
+                    for m,o in zip(src_values[0], src_values[1]): values[u].append((m[0], m[1]+o*scale) if isinstance(m, tuple) else (m, o*scale))
             case Ops.RANGE if u.dtype != dtypes.void:
                 if u not in values: values[u] = [0] * warp_size
                 else:
