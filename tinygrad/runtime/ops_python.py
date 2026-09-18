@@ -12,6 +12,9 @@ from tinygrad.renderer import tc
 from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp
 from tinygrad.renderer import Renderer
 
+NON_VAL_OPS = {Ops.END, Ops.IF, Ops.ENDIF, Ops.STORE, Ops.RANGE,
+    Ops.BARRIER, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.CUSTOM_FUNCTION}
+
 def _load(m, i, dtype: DType):
   if i is None: return 0.0
   if i < 0 or i >= len(m): raise IndexError(f"load out of bounds, size is {len(m)} and access is {i}")
@@ -64,95 +67,82 @@ class PythonProgram(Program['PythonDevice']):
         src_values = [values[v] for v in u.src if v.dtype is not dtypes.void]
         src_dtypes = [v.dtype for v in u.src if v.dtype is not dtypes.void]
         if getenv("TRACE"): print(i, u.op, u.dtype, u.arg, src_values, src_dtypes)
-        if u.op is Ops.END:
-          if len(u.src) == 3:
-            # conditional backedge on a loop: jump back while the condition is true
-            if values[u.src[2]][0]: i = self.uop_to_index[u.src[1]]
-            else: i += 1
-          else: i = self.uop_to_index[u.src[1]]
-          continue
-        if u.op is Ops.IF:
-          exec_masks.append([x and y for x,y in zip(exec_masks[-1], src_values[0])])
-          i += 1
-          continue
-        if u.op is Ops.ENDIF:
-          exec_masks.pop()
-          i += 1
-          continue
-        if u.op in (Ops.BARRIER, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.CUSTOM_FUNCTION) or (u.op is Ops.RANGE and u.dtype == dtypes.void):
-          # in the python emulator, the warp is always in sync
-          i += 1
-          continue
-        if u.op is Ops.STORE:
-          assert len(src_values) == 2, f"STORE must be lowered to 2 srcs, got {len(src_values)}"
-          store_gate = exec_masks[-1]
-          for j,val in enumerate(src_values[1] if u.max_numel() > 1 else [src_values[1]]):
-            for (m,o),v,g in zip(src_values[0], val, store_gate):
-              if g: _store(m, o+j*_step(m, src_dtypes[1]), v, src_dtypes[1])
-          i += 1
-          continue
-        if u.op is Ops.AFTER or (u.op is Ops.BITCAST and u.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL)): values[u] = src_values[0]
-        elif u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU: values[u] = [pvals.pop(0)] * warp_size
-        elif u.op in {Ops.PARAM, Ops.BUFFER}:
-          storage_fmt = storage_fmt_for_dtype(u.dtype)
-          if storage_fmt is None: raise RuntimeError(f"dtype={u.dtype} is not supported")
-          if TYPE_CHECKING or sys.version_info < (3, 12): assert storage_fmt != "e"
-          if u.addrspace == AddrSpace.REG:
-            # REGs are per thread
-            values[u] = [memoryview(bytearray(u.max_numel()*u.dtype.itemsize)).cast(storage_fmt) for _ in range(warp_size)]
-          else:
-            size = u.max_numel() * u.dtype.itemsize
-            buf = memoryview(bytearray(size)) if u.op is not Ops.PARAM else to_mv(pbufs.pop(0), size)
-            values[u] = [buf.cast(storage_fmt)] * warp_size
-        elif u.op is Ops.SPECIAL:
-          if u.arg[0] == 'g': values[u] = [idxs[2-int(u.arg[-1])]] * warp_size
-          elif u.arg[0] == 'l': values[u] = [x[2-int(u.arg[-1])] for x in warp]
-        elif u.op is Ops.CONST: values[u] = [u.val] * warp_size
-        elif u.op in {Ops.INDEX, Ops.SHRINK}:
-          ret:list = []
-          if u.src[0].addrspace == AddrSpace.ALU:
-            ret = [src_values[0][i][t] for t,i in enumerate(src_values[1])]
-          elif is_image_shape(u.src[0]._shape):
-            for m,oy,ox in zip(*src_values):
-              if ox < 0 or ox >= u.src[0]._shape[1] or oy < 0 or oy >= u.src[0]._shape[0]: ret.append((m, None))
-              else: ret.append((m, ox*4 + oy*u.src[0]._shape[1]*4))
-          else:
-            scale = u.src[0].dtype.itemsize // u.src[0].src[0].dtype.itemsize if u.src[0].op is Ops.BITCAST else 1
-            for m,o in zip(src_values[0], src_values[1]): ret.append((m[0], m[1]+o*scale) if isinstance(m, tuple) else (m, o*scale))
-          values[u] = ret
-        elif u.op is Ops.RANGE:
-          if u not in values: values[u] = [0] * warp_size
-          else:
-            for j in range(len(values[u])):
-              values[u][j] += 1
-          if values[u][0] == src_values[0][0]:
-            del values[u]
-            i = self.loop_ends[u] + 1
-            continue
-        elif u.op is Ops.STACK: values[u] = src_values
-        elif u.op is Ops.BITCAST: values[u] = [bitcast(x, src_dtypes[0], u.dtype) for x in src_values[0]]
-        elif u.op is Ops.CAST:
-          values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
-        elif u.op is Ops.LOAD:
-          if (load_sz := u.max_numel()) > 1:
-            # buf and gate are not vecs
-            values[u] = [load([src_values[k] if k in [0,2] else src_values[k][j] \
-                               for k in range(len(src_values))], j, u.dtype) for j in range(load_sz)]
-          else:
-            values[u] = load(src_values, 0, u.dtype)
-        elif u.op is Ops.CALL:
-          restype = None if u.dtype is dtypes.void else getattr(ctypes, f"c_{'u' if u.dtype in dtypes.uints else ''}int{u.dtype.bitsize}")
-          cfunc = ctypes.CFUNCTYPE(restype, *[ctypes.c_uint64] * len(src_values))
-          values[u] = []
-          for fptr,args,gate in zip(values[u.src[0].src[0]], zip(*src_values), exec_masks[-1]):
-            call_args = [(mv_address(x[0]) + x[1]*dt.itemsize) if isinstance(x, tuple) else x for x,dt in zip(args, src_dtypes)]
-            values[u].append(cfunc(fptr)(*call_args) if gate else None)
-        elif u.op is Ops.WMMA: values[u] = wmma(self.tensor_cores, u.arg, src_values, warp_size)
-        elif u.op in GroupOp.ALU:
-          assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {u.op}"
-          assert all_same([u.dtype] + src_dtypes) or u.op in {*GroupOp.Comparison, Ops.WHERE, Ops.SHL, Ops.SHR}, f"dtype mismatch on {u.op}"
-          values[u] = [exec_alu(u.op, u.dtype, p) for p in zip(*src_values)]
-        assert u in values, u
+        match u.op:
+            case Ops.END:
+                if len(u.src) != 3 or values[u.src[2]][0]:
+                    i = self.uop_to_index[u.src[1]]
+                    continue
+            case Ops.IF: exec_masks.append([x and y for x,y in zip(exec_masks[-1], src_values[0])])
+            case Ops.ENDIF: exec_masks.pop()
+            case Ops.STORE:
+                assert len(src_values) == 2, f"STORE must be lowered to 2 srcs, got {len(src_values)}"
+                store_gate = exec_masks[-1]
+                for j,val in enumerate(src_values[1] if u.max_numel() > 1 else [src_values[1]]):
+                    for (m,o),v,g in zip(src_values[0], val, store_gate):
+                        if g: _store(m, o+j*_step(m, src_dtypes[1]), v, src_dtypes[1])
+            case Ops.AFTER: values[u] = src_values[0]
+            case Ops.BITCAST:
+                if u.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL): values[u] = src_values[0]
+                else: values[u] = [bitcast(x, src_dtypes[0], u.dtype) for x in src_values[0]]
+            case Ops.PARAM | Ops.BUFFER:
+                if u.addrspace is AddrSpace.ALU and u.op is Ops.PARAM: values[u] = [pvals.pop(0)] * warp_size
+                else:
+                    storage_fmt = storage_fmt_for_dtype(u.dtype)
+                    if storage_fmt is None: raise RuntimeError(f"dtype={u.dtype} is not supported")
+                    if TYPE_CHECKING or sys.version_info < (3, 12): assert storage_fmt != "e"
+                    if u.addrspace is AddrSpace.REG:
+                        values[u] = [memoryview(bytearray(u.max_numel()*u.dtype.itemsize)).cast(storage_fmt) for _ in range(warp_size)]
+                    else:
+                        size = u.max_numel() * u.dtype.itemsize
+                        buf = memoryview(bytearray(size)) if u.op is not Ops.PARAM else to_mv(pbufs.pop(0), size)
+                        values[u] = [buf.cast(storage_fmt)] * warp_size
+            case Ops.SPECIAL:
+                if u.arg[0] == 'g': values[u] = [idxs[2-int(u.arg[-1])]] * warp_size
+                elif u.arg[0] == 'l': values[u] = [x[2-int(u.arg[-1])] for x in warp]
+            case Ops.INDEX | Ops.SHRINK:
+                ret: list = []
+                if u.src[0].addrspace is AddrSpace.ALU:
+                    ret = [src_values[0][i][t] for t,i in enumerate(src_values[1])]
+                elif is_image_shape(u.src[0]._shape):
+                    for m,oy,ox in zip(*src_values):
+                        if ox < 0 or ox >= u.src[0]._shape[1] or oy < 0 or oy >= u.src[0]._shape[0]: ret.append((m, None))
+                        else: ret.append((m, ox*4 + oy*u.src[0]._shape[1]*4))
+                else:
+                    scale = u.src[0].dtype.itemsize // u.src[0].src[0].dtype.itemsize if u.src[0].op is Ops.BITCAST else 1
+                    for m,o in zip(src_values[0], src_values[1]): ret.append((m[0], m[1]+o*scale) if isinstance(m, tuple) else (m, o*scale))
+                values[u] = ret
+            case Ops.RANGE if u.dtype != dtypes.void:
+                if u not in values: values[u] = [0] * warp_size
+                else:
+                    for j in range(len(values[u])): values[u][j] += 1
+                if values[u][0] == src_values[0][0]:
+                    del values[u]
+                    i = self.loop_ends[u] + 1
+                    continue
+            case Ops.STACK: values[u] = src_values
+            case Ops.CAST: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
+            case Ops.LOAD:
+                if (load_sz := u.max_numel()) > 1:
+                    # buf and gate are not vecs
+                    values[u] = []
+                    for j in range(load_sz):
+                        v = [src_values[k] if k in (0, 2) else src_values[k][j] for k in range(len(src_values))]
+                        values[u].append(load(v, j, u.dtype))
+                else: values[u] = load(src_values, 0, u.dtype)
+            case Ops.CONST: values[u] = [u.val] * warp_size
+            case Ops.CALL:
+                restype = None if u.dtype is dtypes.void else getattr(ctypes, f"c_{'u' if u.dtype in dtypes.uints else ''}int{u.dtype.bitsize}")
+                cfunc = ctypes.CFUNCTYPE(restype, *[ctypes.c_uint64] * len(src_values))
+                values[u] = []
+                for fptr,args,gate in zip(values[u.src[0].src[0]], zip(*src_values), exec_masks[-1]):
+                    call_args = [(mv_address(x[0]) + x[1]*dt.itemsize) if isinstance(x, tuple) else x for x,dt in zip(args, src_dtypes)]
+                    values[u].append(cfunc(fptr)(*call_args) if gate else None)
+            case Ops.WMMA: values[u] = wmma(self.tensor_cores, u.arg, src_values, warp_size)
+            case op if op in GroupOp.ALU:
+                assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {u.op}"
+                assert all_same([u.dtype] + src_dtypes) or u.op in {*GroupOp.Comparison, Ops.WHERE, Ops.SHL, Ops.SHR}, f"dtype mismatch on {u.op}"
+                values[u] = [exec_alu(u.op, u.dtype, p) for p in zip(*src_values)]
+        assert u.op in NON_VAL_OPS or u in values, u
         i += 1
     return time.perf_counter() - st
 
